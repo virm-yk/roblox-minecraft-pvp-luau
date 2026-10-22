@@ -1,0 +1,111 @@
+# --- Downloaded originals / recovered source -----------------------------
+# The original ten scripts were recovered from an export archive for diffing.
+downloaded_originals/
+original_scripts/
+recovered/
+
+# --- Archives -------------------------------------------------------------
+*.zip
+*.7z
+*.rar
+*.tar
+*.tar.gz
+*.tgz
+*.gz
+*.bz2
+*.xz
+
+# --- Minecraft Java / MCP reference material -----------------------------
+# Decompiled sources, MCP mappings, and any Minecraft jar are excluded.
+*.java
+*.class
+*.jar
+*.jars
+*.mcp
+*.cfg
+*.srg
+*.exc
+*.lzma
+minecraft_1_9_reference/
+minecraft_*_reference/
+ref/
+mcp/
+MCP/
+conf/
+CHANGELOG
+CHANGELOG.*
+
+# --- Credentials and secrets ---------------------------------------------
+.env
+.env.*
+*.env
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.keystore
+credentials*
+secrets*
+*token*.txt
+*secret*.txt
+.netrc
+.aws/
+.ssh/
+id_rsa*
+id_ed25519*
+
+# --- Local / sandbox paths -----------------------------------------------
+local-projects/
+local_project/
+scratch/
+sandbox/
+tmp/
+temp/
+.cache/
+.freebuff/
+
+# --- Logs and tool output -------------------------------------------------
+*.log
+*.out
+logs/
+coverage/
+*.lcov
+*.prof
+*.trace
+
+# --- Test caches and build output ----------------------------------------
+.build/
+build/
+dist/
+out/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.hypothesis/
+luau-*
+*.luac
+
+# --- Tools and generated reports -----------------------------------------
+tools/
+BASELINE_SNAPSHOT.md
+STAGE1_INSPECTION.md
+publish_staging/
+publish_manifest.json
+*.tmp
+*.bak
+*.orig
+*.rej
+*~
+
+# --- OS / editor ----------------------------------------------------------
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
+*.swp
+*.swo

@@ -1,0 +1,18 @@
+# Byte-exact transfer.
+#
+# These files are installed into Roblox Studio by hand, so what is checked out must be
+# byte-identical to what was committed. Git's core.autocrlf rewrites line endings on
+# checkout (Windows defaults to CRLF), which would silently change the byte count of
+# every file. eol=lf overrides core.autocrlf and keeps the working tree identical to
+# the blobs on every platform.
+#
+# Do not add a rule here that rewrites content.
+
+* text=auto eol=lf
+
+# No normalisation for anything that must stay byte-identical regardless of detection.
+*.png binary
+*.rbxl binary
+*.rbxlx binary
+*.rbxm binary
+*.rbxmx binary
