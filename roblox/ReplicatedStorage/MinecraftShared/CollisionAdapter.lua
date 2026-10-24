@@ -20,11 +20,30 @@
 --   physics difference. `validatePrimitive` returns the reason, and
 --   `fromFolder` either errors (Strict) or records it in the report.
 --
+-- OVERSIZED, never truncated:
+--   A box that would be bucketed into more than Collision.MaxCellsPerBox cells is
+--   rejected with Category "Oversized" and a reason that states the cell count,
+--   the cap, and the part responsible. It is NOT clipped, split, or dropped
+--   silently, and it cannot abort a rebuild: the check happens before
+--   Collision.addBox, which would otherwise raise.
+--
 -- IGNORED, by design:
 --   * anything under a Model containing a Humanoid (character parts, accessory
 --     handles) - the visual body never becomes world solid
 --   * anything under a container named in Collision.IgnoreNames
 --     (DebugGeometry/Visuals/Effects) or listed in options.Ignore
+--
+-- REBUILDING (CollisionAdapter.watch):
+--   A world is static for as long as it is used, but the place is not frozen.
+--   `watch` keeps one World reference current:
+--     * builds immediately, even when workspace.World does not exist yet;
+--     * rescans when the folder appears, disappears, is reparented, gains or
+--       loses descendants, or when a registered part's geometry changes;
+--     * swaps in a BRAND NEW world on every rebuild, so no box is ever
+--       registered twice and a failed build cannot leave a half-populated
+--       world behind;
+--     * coalesces bursts of changes with Collision.RebuildDebounceSeconds.
+--   Callers read `watched.World` at use time; they must not cache it.
 --
 -- Geometry contract: the registered folder is authored on a 4-stud grid aligned
 -- with the world origin, so one block = 4 studs = MovementConfig.Units.
@@ -50,13 +69,14 @@ export type Primitive = {
 
 export type Validation = {
 	Ok: boolean,
-	Category: string?, -- "Ignored" | "Excluded" | "Unsupported" when not Ok
+	Category: string?, -- "Ignored" | "Excluded" | "Unsupported" | "Oversized" when not Ok
 	Reason: string?,
 }
 
 export type Rejection = {
 	Part: BasePart?,
 	Reason: string,
+	Category: string?,
 }
 
 export type Report = {
@@ -64,7 +84,8 @@ export type Report = {
 	Accepted: number,
 	Excluded: number,
 	Ignored: number,
-	Unsupported: { Rejection },
+	Oversized: number, -- rejected because a single box exceeded MaxCellsPerBox
+	Unsupported: { Rejection }, -- includes the oversized entries, with their reasons
 	MissingFolder: boolean?,
 }
 
@@ -72,6 +93,24 @@ export type Options = {
 	World: Collision.World?,
 	Strict: boolean?, -- error on the first unsupported part instead of reporting
 	Ignore: { Instance }?, -- extra instances whose descendants are skipped
+}
+
+-- Returned by `watch`. `World` is the only field callers read during play;
+-- everything else exists for diagnostics and teardown.
+export type Watched = {
+	Options: Options,
+	World: Collision.World,
+	Report: Report,
+	Version: number,
+	Rebuilds: number,
+	LastRebuildReason: string?,
+	Folder: Instance?,
+	Destroyed: boolean,
+	OnRebuilt: (((Collision.World, Report, string?) -> ()))?,
+	Connections: { RBXScriptConnection },
+	PartConnections: { RBXScriptConnection },
+	Scheduled: boolean,
+	PendingReason: string?,
 }
 
 local function isFiniteNumber(value: any): boolean
@@ -176,14 +215,38 @@ function CollisionAdapter.registerPrimitive(
 	if not validation.Ok then
 		return false, validation
 	end
+
+	local box = CollisionAdapter.boxFromPrimitive(primitive)
+	local cells = Collision.cellCount(box)
+	local cap = MovementConfig.Collision.MaxCellsPerBox
+	if cells > cap then
+		-- Reported before addBox, which raises on the same condition. A single
+		-- oversized part must not abort a whole rebuild.
+		return false, {
+			Ok = false,
+			Category = "Oversized",
+			Reason = string.format(
+				"oversized: %s would span %d block cells, over the %d-cell cap; split it into smaller parts",
+				label or "primitive",
+				cells,
+				cap
+			),
+		}
+	end
+
 	if world.Count >= MovementConfig.Collision.MaxBoxes then
 		return false, {
 			Ok = false,
 			Category = "Unsupported",
-			Reason = "collision box budget exhausted",
+			Reason = string.format(
+				"collision box budget exhausted (%d boxes); %s was not registered",
+				MovementConfig.Collision.MaxBoxes,
+				label or "primitive"
+			),
 		}
 	end
-	Collision.addBox(world, CollisionAdapter.boxFromPrimitive(primitive), label)
+
+	Collision.addBox(world, box, label)
 	return true, validation
 end
 
@@ -248,6 +311,7 @@ function CollisionAdapter.fromFolder(folder: Instance?, options: Options?): (Col
 		Accepted = 0,
 		Excluded = 0,
 		Ignored = 0,
+		Oversized = 0,
 		Unsupported = {},
 	}
 
@@ -276,7 +340,14 @@ function CollisionAdapter.fromFolder(folder: Instance?, options: Options?): (Col
 		elseif validation.Category == "Excluded" then
 			report.Excluded += 1
 		else
-			table.insert(report.Unsupported, { Part = part, Reason = validation.Reason or "unsupported" })
+			if validation.Category == "Oversized" then
+				report.Oversized += 1
+			end
+			table.insert(report.Unsupported, {
+				Part = part,
+				Reason = validation.Reason or "unsupported",
+				Category = validation.Category,
+			})
 			if opts.Strict then
 				error(
 					string.format(
@@ -293,30 +364,257 @@ function CollisionAdapter.fromFolder(folder: Instance?, options: Options?): (Col
 	return world, report
 end
 
--- Convenience entry point for both scripts: builds the shared static world from
--- workspace.<Collision.WorldFolder>. Missing folder is reported, not fatal, so a
--- place without test geometry still runs.
-function CollisionAdapter.fromWorkspace(options: Options?): (Collision.World, Report)
-	local folder = workspace:FindFirstChild(MovementConfig.Collision.WorldFolder)
-	local world, report = CollisionAdapter.fromFolder(folder, options)
+local function warnReport(report: Report, context: string)
 	if report.MissingFolder then
 		warn(
 			string.format(
-				"[CollisionAdapter] workspace.%s not found: collision world is empty",
-				MovementConfig.Collision.WorldFolder
+				"[CollisionAdapter] workspace.%s not found (%s): collision world is empty until it appears",
+				MovementConfig.Collision.WorldFolder,
+				context
 			)
 		)
 	end
-	if #report.Unsupported > 0 then
+	local firstOversized, firstUnsupported = nil, nil
+	for _, rejection in ipairs(report.Unsupported) do
+		if rejection.Category == "Oversized" then
+			firstOversized = firstOversized or rejection.Reason
+		else
+			firstUnsupported = firstUnsupported or rejection.Reason
+		end
+	end
+	if report.Oversized > 0 then
 		warn(
 			string.format(
-				"[CollisionAdapter] %d unsupported part(s) were not registered as solid; first: %s",
-				#report.Unsupported,
-				report.Unsupported[1].Reason
+				"[CollisionAdapter] %d oversized part(s) were REJECTED, not clipped (%s); first: %s",
+				report.Oversized,
+				context,
+				firstOversized or "see report"
 			)
 		)
 	end
+	if #report.Unsupported > report.Oversized then
+		warn(
+			string.format(
+				"[CollisionAdapter] %d unsupported part(s) were not registered as solid (%s); first: %s",
+				#report.Unsupported - report.Oversized,
+				context,
+				firstUnsupported or "see report"
+			)
+		)
+	end
+end
+
+-- Convenience entry point: one-shot build from workspace.<Collision.WorldFolder>.
+-- Missing folder is reported, not fatal. Prefer `watch` for anything that keeps
+-- running, because a one-shot build cannot notice later geometry.
+function CollisionAdapter.fromWorkspace(options: Options?): (Collision.World, Report)
+	local folder = workspace:FindFirstChild(MovementConfig.Collision.WorldFolder)
+	local world, report = CollisionAdapter.fromFolder(folder, options)
+	warnReport(report, "one-shot build")
 	return world, report
+end
+
+-- ===== Watched world (rescan on change, never duplicate) =====
+
+local function disconnectAll(connections: { RBXScriptConnection })
+	for index = #connections, 1, -1 do
+		connections[index]:Disconnect()
+		connections[index] = nil
+	end
+end
+
+local function watchPart(watched: Watched, part: BasePart)
+	local function changed()
+		CollisionAdapter.scheduleRebuild(watched, "PartPropertyChanged")
+	end
+
+	local properties = { "Size", "Anchored", "CanCollide" }
+	if part:IsA("Part") then
+		table.insert(properties, "Shape")
+	end
+	if part.Anchored then
+		-- Unanchored parts move every physics step; they are rejected anyway, so
+		-- watching their CFrame would only churn rebuilds.
+		table.insert(properties, "CFrame")
+	end
+	for _, property in ipairs(properties) do
+		table.insert(watched.PartConnections, part:GetPropertyChangedSignal(property):Connect(changed))
+	end
+end
+
+local function attachWatchers(watched: Watched)
+	disconnectAll(watched.Connections)
+	disconnectAll(watched.PartConnections)
+
+	local function schedule()
+		CollisionAdapter.scheduleRebuild(watched, "WorldChanged")
+	end
+
+	local folder = watched.Folder
+	if folder ~= nil then
+		table.insert(
+			watched.Connections,
+			folder.DescendantAdded:Connect(function()
+				schedule()
+			end)
+		)
+		table.insert(
+			watched.Connections,
+			folder.DescendantRemoving:Connect(function()
+				schedule()
+			end)
+		)
+		table.insert(
+			watched.Connections,
+			folder.AncestryChanged:Connect(function()
+				schedule()
+			end)
+		)
+		table.insert(
+			watched.Connections,
+			folder:GetPropertyChangedSignal("Name"):Connect(function()
+				-- rename away from/towards World changes which folder is authoritative
+				CollisionAdapter.scheduleRebuild(watched, "FolderRenamed")
+			end)
+		)
+		for _, descendant in ipairs(folder:GetDescendants()) do
+			if descendant:IsA("BasePart") then
+				watchPart(watched, descendant)
+			end
+		end
+	end
+
+	-- The folder itself may be created, destroyed, or replaced at any time.
+	table.insert(
+		watched.Connections,
+		workspace.ChildAdded:Connect(function(child)
+			if child.Name == MovementConfig.Collision.WorldFolder then
+				CollisionAdapter.scheduleRebuild(watched, "WorldAdded")
+			end
+		end)
+	)
+	table.insert(
+		watched.Connections,
+		workspace.ChildRemoved:Connect(function(child)
+			if child.Name == MovementConfig.Collision.WorldFolder then
+				CollisionAdapter.scheduleRebuild(watched, "WorldRemoved")
+			end
+		end)
+	)
+end
+
+-- Rebuilds now, into a new World. Safe to call at any time; never nests.
+function CollisionAdapter.rebuild(watched: Watched, reason: string?): (Collision.World, Report)
+	if watched.Destroyed then
+		return watched.World, watched.Report
+	end
+
+	local label = reason or "Manual"
+	local folder = workspace:FindFirstChild(MovementConfig.Collision.WorldFolder)
+	watched.Folder = folder
+	-- Attach first, so a part added while the world is being built still
+	-- schedules the next rebuild instead of slipping through the gap.
+	attachWatchers(watched)
+
+	local options: Options = {
+		Strict = watched.Options.Strict,
+		Ignore = watched.Options.Ignore,
+	}
+	local world, report = CollisionAdapter.fromFolder(folder, options)
+
+	watched.World = world
+	watched.Report = report
+	watched.Version += 1
+	watched.Rebuilds += 1
+	watched.LastRebuildReason = label
+
+	local summary = string.format(
+		"[CollisionAdapter] world v%d rebuilt (%s): %d accepted, %d excluded, %d ignored, %d oversized, %d unsupported",
+		watched.Version,
+		label,
+		report.Accepted,
+		report.Excluded,
+		report.Ignored,
+		report.Oversized,
+		#report.Unsupported
+	)
+	if report.MissingFolder then
+		warn(summary)
+	else
+		print(summary)
+	end
+	warnReport(report, label)
+
+	if watched.OnRebuilt ~= nil then
+		watched.OnRebuilt(world, report, label)
+	end
+	return world, report
+end
+
+-- Coalesces changes: the first change starts one timer; every change before it
+-- fires only replaces the pending reason. Callers therefore see at most one
+-- rebuild per RebuildDebounceSeconds, always of the latest state.
+function CollisionAdapter.scheduleRebuild(watched: Watched, reason: string?)
+	if watched.Destroyed then
+		return
+	end
+	watched.PendingReason = reason
+	if watched.Scheduled then
+		return
+	end
+	watched.Scheduled = true
+	task.delay(MovementConfig.Collision.RebuildDebounceSeconds, function()
+		watched.Scheduled = false
+		if watched.Destroyed then
+			return
+		end
+		local pending = watched.PendingReason
+		watched.PendingReason = nil
+		CollisionAdapter.rebuild(watched, pending or "Scheduled")
+	end)
+end
+
+function CollisionAdapter.stopWatching(watched: Watched)
+	watched.Destroyed = true
+	watched.Scheduled = false
+	watched.PendingReason = nil
+	disconnectAll(watched.Connections)
+	disconnectAll(watched.PartConnections)
+end
+
+-- Builds the first world immediately, then keeps it current. Returns the live
+-- handle; read `watched.World` at use time rather than caching it. Options.World
+-- is ignored on purpose: a watched handle always owns a world it built itself,
+-- which is what makes "a rebuild never duplicates a box" true.
+function CollisionAdapter.watch(
+	options: Options?,
+	onRebuilt: ((Collision.World, Report, string?) -> ())?
+): Watched
+	local emptyWorld = Collision.newWorld()
+	local watched: Watched = {
+		Options = options or {},
+		World = emptyWorld,
+		Report = {
+			World = emptyWorld,
+			Accepted = 0,
+			Excluded = 0,
+			Ignored = 0,
+			Oversized = 0,
+			Unsupported = {},
+		},
+		Version = 0,
+		Rebuilds = 0,
+		LastRebuildReason = nil,
+		Folder = nil,
+		Destroyed = false,
+		OnRebuilt = onRebuilt,
+		Connections = {},
+		PartConnections = {},
+		Scheduled = false,
+		PendingReason = nil,
+	}
+	CollisionAdapter.rebuild(watched, "Initial")
+	return watched
 end
 
 return CollisionAdapter

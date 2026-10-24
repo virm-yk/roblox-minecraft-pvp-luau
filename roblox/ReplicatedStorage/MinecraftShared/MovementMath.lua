@@ -44,6 +44,12 @@ local MovementMath = {}
 MovementMath.PHYSICS_IMPLEMENTED = false
 
 -- ===== Roblox boundary conversions (the ONLY place studs and blocks meet) =====
+--
+-- Every function that crosses into Roblox space takes the root-to-feet offset
+-- explicitly. It is measured per rig at runtime by RigOffset (HipHeight + half
+-- the root height) and must be the SAME value used by the server and the client
+-- for that character. There is no constant to fall back to here on purpose: a
+-- silently wrong offset puts the whole rig at the wrong height.
 
 function MovementMath.blocksToStuds(value: Vector3): Vector3
 	return value * MovementConfig.Units.StudsPerBlock
@@ -53,23 +59,38 @@ function MovementMath.studsToBlocks(value: Vector3): Vector3
 	return value / MovementConfig.Units.StudsPerBlock
 end
 
+local function requireOffset(rootToFeetOffsetStuds: number): number
+	if
+		type(rootToFeetOffsetStuds) ~= "number"
+		or rootToFeetOffsetStuds ~= rootToFeetOffsetStuds
+		or rootToFeetOffsetStuds == math.huge
+		or rootToFeetOffsetStuds == -math.huge
+		or rootToFeetOffsetStuds <= 0
+	then
+		error("MovementMath: root-to-feet offset must be a finite positive number of studs", 3)
+	end
+	return rootToFeetOffsetStuds
+end
+
 -- Feet position (blocks) -> HumanoidRootPart position (studs).
-function MovementMath.feetBlocksToRootStuds(feet: Vector3): Vector3
-	return MovementMath.blocksToStuds(feet) + Vector3.new(0, MovementConfig.Units.RootToFeetOffsetStuds, 0)
+function MovementMath.feetBlocksToRootStuds(feet: Vector3, rootToFeetOffsetStuds: number): Vector3
+	local offset = requireOffset(rootToFeetOffsetStuds)
+	return MovementMath.blocksToStuds(feet) + Vector3.new(0, offset, 0)
 end
 
 -- HumanoidRootPart position (studs) -> feet position (blocks).
-function MovementMath.rootStudsToFeetBlocks(root: Vector3): Vector3
-	return MovementMath.studsToBlocks(root - Vector3.new(0, MovementConfig.Units.RootToFeetOffsetStuds, 0))
+function MovementMath.rootStudsToFeetBlocks(root: Vector3, rootToFeetOffsetStuds: number): Vector3
+	local offset = requireOffset(rootToFeetOffsetStuds)
+	return MovementMath.studsToBlocks(root - Vector3.new(0, offset, 0))
 end
 
 -- Simulation state -> CFrame for the HumanoidRootPart.
 -- Yaw convention: 0 degrees faces +Z, forward = (-sin(yaw), 0, cos(yaw)).
 -- `presentationOffsetBlocks` is a presentation-only correction owned by the
 -- client; it never feeds back into the simulation state.
-function MovementMath.toRootCFrame(state: State, presentationOffsetBlocks: Vector3?): CFrame
+function MovementMath.toRootCFrame(state: State, rootToFeetOffsetStuds: number, presentationOffsetBlocks: Vector3?): CFrame
 	local offset = presentationOffsetBlocks or Vector3.zero
-	local rootPosition = MovementMath.feetBlocksToRootStuds(state.Position + offset)
+	local rootPosition = MovementMath.feetBlocksToRootStuds(state.Position + offset, rootToFeetOffsetStuds)
 	local yaw = math.rad(state.Yaw)
 	local forward = Vector3.new(-math.sin(yaw), 0, math.cos(yaw))
 	return CFrame.lookAt(rootPosition, rootPosition + forward)

@@ -14,6 +14,10 @@
 --   It never sends input before it has adopted a generation from a snapshot, so
 --   input can never be attributed to the wrong character.
 --
+--   Seq and ServerTick are independent clocks and are never compared. Seq only
+--   orders/acknowledges/replays input; ServerTick only drives simulation time
+--   and snapshot ordering.
+--
 -- Combat is disabled at this stage; the server still owns the combat remotes.
 
 local Players = game:GetService("Players")
@@ -26,14 +30,17 @@ local MovementMath = require(Shared:WaitForChild("MovementMath"))
 local CollisionAdapter = require(Shared:WaitForChild("CollisionAdapter"))
 local InputState = require(Shared:WaitForChild("InputState")) -- neutral frame for the debug readout
 local Reconcile = require(Shared:WaitForChild("Reconcile"))
+local RigOffset = require(Shared:WaitForChild("RigOffset"))
 
 -- Both live beside this LocalScript under PlayerScripts at runtime.
 local InputController = require(script.Parent:WaitForChild("InputController"))
 local InputDebugOverlay = require(script.Parent:WaitForChild("InputDebugOverlay"))
 
--- Static collision geometry is built once and shared by every predicted step.
--- Characters and debug models are never registered as world solid.
-local collisionWorld = CollisionAdapter.fromWorkspace({ Strict = false })
+-- Static collision geometry, kept current by a watched rebuild. Prediction
+-- reads collision.World at replay time, so geometry added after startup is used
+-- and a rebuild can never double-register a box. Characters and debug models
+-- are never registered as world solid.
+local collision = CollisionAdapter.watch({ Strict = false })
 
 local localPlayer = Players.LocalPlayer
 local input = InputController.new()
@@ -60,7 +67,11 @@ local current = {
 	invalidSnapshots = 0,
 	offset = Vector3.zero, -- presentation-only correction, in BLOCKS
 	rootPart = nil,
-	collisionWorld = collisionWorld,
+	-- Authoritative offset from the latest accepted snapshot. Until one arrives
+	-- (RenderStepped is gated on `ready`), the documented fallback is used.
+	rootToFeetOffsetStuds = MovementConfig.Units.RootToFeetOffsetStudsFallback,
+	localRootToFeetOffsetStuds = nil, -- this client's own measurement, diagnostics only
+	offsetMismatchWarned = false,
 	characterToken = 0,
 	controller = nil,
 	lastResyncRequest = -math.huge,
@@ -157,7 +168,7 @@ local function onSnapshot(payload)
 
 	-- Setup may still be running (or this is a stale character). The server
 	-- resends periodically, so dropping this one loses nothing.
-	if current.collisionWorld == nil or current.rootPart == nil then
+	if current.rootPart == nil then
 		return
 	end
 
@@ -173,6 +184,26 @@ local function onSnapshot(payload)
 	end
 
 	local isNewGeneration = acceptance == "NewGeneration"
+
+	-- The server's measured offset is authoritative for presentation. A local
+	-- difference is worth one warning: it means the two copies of the rig do not
+	-- match, which would otherwise show up as a permanent height fight.
+	local localOffset = current.localRootToFeetOffsetStuds
+	if
+		localOffset ~= nil
+		and math.abs(localOffset - snapshot.RootToFeetOffsetStuds) > 0.001
+		and not current.offsetMismatchWarned
+	then
+		current.offsetMismatchWarned = true
+		warn(
+			string.format(
+				"[MinecraftClient] rig offset disagreement: local %.3f, server %.3f; presenting with the server value",
+				localOffset,
+				snapshot.RootToFeetOffsetStuds
+			)
+		)
+	end
+	current.rootToFeetOffsetStuds = snapshot.RootToFeetOffsetStuds
 
 	if isNewGeneration then
 		current.generation = snapshot.Generation
@@ -191,7 +222,7 @@ local function onSnapshot(payload)
 
 	-- The authoritative state is ALWAYS the replay base. Velocity, flags,
 	-- timers, and health are corrected even when position barely moved.
-	local updated, remaining, _replayed = Reconcile.apply(snapshot.State, current.pending, current.collisionWorld)
+	local updated, remaining, _replayed = Reconcile.apply(snapshot.State, current.pending, collision.World)
 
 	local offset = Reconcile.computeOffset(
 		current.predicted,
@@ -240,7 +271,7 @@ local function stepClientTick()
 	current.nextSeq += 1
 	current.localTick += 1
 
-	local nextState = MovementMath.step(current.predicted, frame, current.collisionWorld, current.predicted.ServerTick + 1)
+	local nextState = MovementMath.step(current.predicted, frame, collision.World, current.predicted.ServerTick + 1)
 
 	current.predicted = nextState
 	table.insert(current.pending, frame)
@@ -335,6 +366,15 @@ local function onCharacterAdded(character)
 		return
 	end
 
+	-- Same resolver the server uses, on this client's copy of the same rig.
+	local rig = RigOffset.measure(character)
+	if rig.Source == "Fallback" then
+		warn(string.format("[MinecraftClient] rig offset not measurable, using fallback: %s", RigOffset.describe(rig)))
+	end
+	-- Recorded for comparison only; the snapshot value is what presentation uses.
+	current.localRootToFeetOffsetStuds = rig.Studs
+	current.offsetMismatchWarned = false
+
 	current.rootPart = root
 	current.controller = takeClientControl(root, humanoid)
 	current.ready = current.predicted ~= nil
@@ -348,6 +388,7 @@ local function onCharacterRemoving()
 	-- from this body can drive the next one.
 	InputController.reset(input, current.generation)
 	current.rootPart = nil
+	current.localRootToFeetOffsetStuds = nil
 end
 
 localPlayer.CharacterAdded:Connect(function(character)
@@ -406,7 +447,11 @@ RunService.RenderStepped:Connect(function(dt)
 		current.offset = Vector3.zero
 	end
 
-	current.rootPart.CFrame = MovementMath.toRootCFrame(current.predicted, current.offset)
+	current.rootPart.CFrame = MovementMath.toRootCFrame(
+		current.predicted,
+		current.rootToFeetOffsetStuds,
+		current.offset
+	)
 end)
 
 -- ===== Debug readout (presentation only) =====

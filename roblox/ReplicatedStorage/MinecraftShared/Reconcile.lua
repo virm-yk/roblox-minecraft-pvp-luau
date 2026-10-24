@@ -13,6 +13,12 @@
 --     timers, and health are never ignored because positional error is small.
 --   * Visual smoothness is a separate, presentation-only offset that decays;
 --     it never feeds back into the simulation state.
+--
+-- `LastAppliedInputSeq` and `ServerTick` are independent clocks (see
+-- MovementConfig): the client's sequence counter advances per predicted step and
+-- drifts from the server's simulation tick by design, so comparing the two
+-- numerically would reject perfectly valid snapshots. Seq is only ever compared
+-- with Seq; ServerTick only with ServerTick.
 
 local MovementConfig = require(script.Parent.MovementConfig)
 local MovementState = require(script.Parent.MovementState)
@@ -27,6 +33,10 @@ export type Snapshot = {
 	Generation: number,
 	ServerTick: number,
 	LastAppliedInputSeq: number,
+	-- Visual root-to-feet distance the server measured for this character, in
+	-- studs. The client uses this value rather than its own measurement so both
+	-- sides place the HumanoidRootPart at exactly the same height.
+	RootToFeetOffsetStuds: number,
 	Reset: boolean,
 	ResetKind: string?,
 	Health: number,
@@ -40,6 +50,7 @@ local ALLOWED_KEYS: { [any]: boolean } = {
 	Generation = true,
 	ServerTick = true,
 	LastAppliedInputSeq = true,
+	RootToFeetOffsetStuds = true,
 	Reset = true,
 	ResetKind = true,
 	Health = true,
@@ -82,7 +93,10 @@ function Reconcile.parseSnapshot(raw: any): Snapshot?
 	if not isIntegerInRange(raw.LastAppliedInputSeq, 0, 2147483647) then
 		return nil
 	end
-	if raw.LastAppliedInputSeq > raw.ServerTick then
+	if not isFiniteNumber(raw.RootToFeetOffsetStuds) then
+		return nil
+	end
+	if raw.RootToFeetOffsetStuds <= 0 or raw.RootToFeetOffsetStuds > MovementConfig.Units.MaxRootToFeetOffsetStuds then
 		return nil
 	end
 	if type(raw.Reset) ~= "boolean" then
@@ -125,6 +139,7 @@ function Reconcile.parseSnapshot(raw: any): Snapshot?
 		Generation = raw.Generation,
 		ServerTick = raw.ServerTick,
 		LastAppliedInputSeq = raw.LastAppliedInputSeq,
+		RootToFeetOffsetStuds = raw.RootToFeetOffsetStuds,
 		Reset = raw.Reset,
 		ResetKind = raw.ResetKind,
 		Health = raw.Health,

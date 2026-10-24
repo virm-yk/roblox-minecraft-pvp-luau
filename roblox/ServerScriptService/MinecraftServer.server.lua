@@ -7,6 +7,11 @@
 --   * run EXACTLY ONE movement step per session per authoritative ServerTick
 --   * send snapshots that identify authoritative time and acknowledged input
 --   * recover with an explicit generation reset when state or history is invalid
+--   * keep the static collision world current when workspace.World changes
+--   * resolve the rig's root-to-feet offset from the live character
+--
+-- CLOCKS: Seq is an input counter and ServerTick is simulation time. They are
+-- different clocks (see MovementConfig) and this script never compares them.
 --
 -- Combat is disabled at this stage (CombatConfig.Enabled == false). The attack
 -- remotes are still created so the client contract and Explorer layout are stable.
@@ -25,6 +30,7 @@ local CollisionAdapter = require(Shared:WaitForChild("CollisionAdapter"))
 local InputState = require(Shared:WaitForChild("InputState"))
 local InputQueue = require(Shared:WaitForChild("InputQueue"))
 local CombatConfig = require(Shared:WaitForChild("CombatConfig"))
+local RigOffset = require(Shared:WaitForChild("RigOffset"))
 
 -- ===== Networking setup =====
 
@@ -46,11 +52,13 @@ local attackRemote = getOrCreate(remotesFolder, "RemoteEvent", CombatConfig.Remo
 local combatResultRemote = getOrCreate(remotesFolder, "RemoteEvent", CombatConfig.Remotes.Result)
 
 -- ===== Static collision world =====
--- Built once: registered geometry is static for the whole session, so every
--- session shares the same immutable world. Movement integration is still
--- disabled; this only validates and registers the geometry.
+-- Registered geometry is still static (anchored parts only), but the place can
+-- change: the adapter watches workspace.World and swaps in a freshly built
+-- world, so an empty startup world is never permanent and no box is ever
+-- registered twice. Sessions read collision.World at step time; nothing caches
+-- the reference. Movement integration is still disabled.
 
-local collisionWorld = CollisionAdapter.fromWorkspace({ Strict = false })
+local collision = CollisionAdapter.watch({ Strict = false })
 
 -- ===== Authoritative clock and sessions =====
 
@@ -82,6 +90,9 @@ local function sendSnapshot(session, reset, kind)
 		Generation = session.Generation,
 		ServerTick = session.State.ServerTick,
 		LastAppliedInputSeq = session.State.LastAppliedInputSeq,
+		-- The client presents with this exact value, so a local rig difference
+		-- can never make the two sides fight over the root height.
+		RootToFeetOffsetStuds = session.RootToFeetOffsetStuds,
 		Reset = reset == true,
 		ResetKind = kind,
 		Health = session.State.Health,
@@ -144,7 +155,7 @@ local function applyStateToCharacter(session)
 	end
 	local root = character:FindFirstChild("HumanoidRootPart")
 	if root ~= nil and root.Parent ~= nil then
-		root.CFrame = MovementMath.toRootCFrame(session.State)
+		root.CFrame = MovementMath.toRootCFrame(session.State, session.RootToFeetOffsetStuds)
 	end
 end
 
@@ -219,9 +230,23 @@ local function createSession(player, character)
 
 	teardownSession(player)
 
+	-- Measure the rig the character actually has. HipHeight and root Size are
+	-- replicated, so the client resolves the same value independently; the
+	-- simulation itself stays in blocks and never sees these studs.
+	local rig = RigOffset.measure(character)
+	if rig.Source == "Fallback" then
+		warn(
+			string.format(
+				"[MinecraftServer] %s: rig offset not measurable, using fallback: %s",
+				player.Name,
+				RigOffset.describe(rig)
+			)
+		)
+	end
+
 	generationCounter += 1
 	local generation = generationCounter
-	local spawnFeet = MovementMath.rootStudsToFeetBlocks(root.Position)
+	local spawnFeet = MovementMath.rootStudsToFeetBlocks(root.Position, rig.Studs)
 	local state = MovementState.spawn(
 		spawnFeet,
 		generation,
@@ -242,9 +267,11 @@ local function createSession(player, character)
 		Stale = false,
 		LastResyncTick = -math.huge,
 		Controller = takeControl(root, humanoid),
-		-- Shared, immutable static geometry. Characters are never registered as
-		-- world solid: player pushing is a separate behavior.
-		CollisionWorld = collisionWorld,
+		-- Resolved once per character. Changing it later would need a re-measure
+		-- and a snapshot reset; not done in this baseline.
+		RootToFeetOffsetStuds = rig.Studs,
+		RigOffsetSource = rig.Source,
+		RigOffsetDetail = rig.Detail,
 		RateWindows = {},
 		-- Diagnostics only, never trusted by logic.
 		MalformedInputs = 0,
@@ -289,7 +316,8 @@ local function simulateSession(session)
 		session.LastInput = frame
 	end
 
-	local nextState = MovementMath.step(session.State, frame, session.CollisionWorld, serverTick)
+	-- collision.World is looked up per step on purpose: a rebuild replaces it.
+	local nextState = MovementMath.step(session.State, frame, collision.World, serverTick)
 
 	if not MovementState.isPlausible(nextState) then
 		session.InvalidStates += 1

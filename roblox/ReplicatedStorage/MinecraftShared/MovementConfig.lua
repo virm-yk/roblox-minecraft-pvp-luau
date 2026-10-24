@@ -18,7 +18,15 @@
 --     sequence whose effects are included in the snapshot state.
 --   * Packet arrival rate NEVER changes the physics step rate.
 --
--- INPUT PIPELINE (schema 2):
+-- CLOCKS - two independent counters, never compared numerically:
+--   * `Seq` / `LastAppliedInputSeq` order, de-duplicate, acknowledge, and replay
+--     input. Nothing else.
+--   * `ServerTick` is server simulation time and drives fixed-tick timers.
+--   A state whose acknowledged Seq is far above (or below) its ServerTick is
+--   completely valid: the client predicts at its own rate and the server drops
+--   catch-up backlog under load, so the two counters drift by design.
+--
+-- INPUT PIPELINE (axis semantics introduced in schema 2, unchanged since):
 --   raw key state (InputController)
 --     -> InputState.process: opposing keys cancel, then the sneak multiplier
 --        (Input.SneakScale) is applied ONCE, exactly where 1.9 applies it
@@ -39,7 +47,11 @@ MovementConfig.Target = "JavaEdition_1.9"
 -- Bump when the wire/state schema changes incompatibly.
 -- 2: MovementInput.MoveForward/MoveStrafe carry the PROCESSED (sneak-scaled)
 --    axes rather than raw key axes. Shape and ordering are unchanged.
-MovementConfig.SchemaVersion = 2
+-- 3: the snapshot envelope carries RootToFeetOffsetStuds, the server-measured
+--    rig offset the client must use for presentation. The movement State shape
+--    is unchanged; an old client rejects a schema-3 snapshot instead of
+--    guessing a root height.
+MovementConfig.SchemaVersion = 3
 
 MovementConfig.Simulation = {
 	TicksPerSecond = 20,
@@ -61,7 +73,13 @@ MovementConfig.Control = {
 
 MovementConfig.Units = {
 	StudsPerBlock = 4,
-	RootToFeetOffsetStuds = 3, -- [UNKNOWN] depends on the real rig's HipHeight; measure in Studio
+	-- Visual HumanoidRootPart centre -> feet distance. There is deliberately no
+	-- single constant: it is measured per rig at runtime by RigOffset from
+	-- Humanoid.HipHeight and HumanoidRootPart.Size.Y (HipHeight + half the root
+	-- height), because HipHeight is authored per place and per rig. These two
+	-- values only bound that measurement.
+	RootToFeetOffsetStudsFallback = 3, -- documented fallback when the rig cannot be measured
+	MaxRootToFeetOffsetStuds = 32, -- sanity ceiling; a larger result is treated as unmeasurable
 }
 
 MovementConfig.Physics = {
@@ -107,8 +125,9 @@ MovementConfig.Collision = {
 	WorldFolder = "World", -- only parts under workspace.World are registered as solid
 	IgnoreNames = { "DebugGeometry", "Visuals", "Effects" }, -- never treated as solid
 	MaxBoxes = 8192,
-	MaxCellsPerBox = 4096, -- guards against a giant box registering millions of cells
+	MaxCellsPerBox = 4096, -- a box over this cap is rejected and reported, never split or clipped
 	UnrotatedTolerance = 0.0001, -- CUSTOM: float slack when checking part orientation
+	RebuildDebounceSeconds = 0.25, -- coalesce bursts of folder/part changes into one rebuild
 }
 
 MovementConfig.Input = {

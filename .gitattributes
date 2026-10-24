@@ -16,3 +16,9 @@
 *.rbxlx binary
 *.rbxm binary
 *.rbxmx binary
+
+# Byte-exact install files whose line endings are part of the deliverable.
+# `-text` disables Git's end-of-line normalisation for these paths, so the
+# committed blob is exactly the file that INSTALL_MANIFEST.md hashes.
+roblox/ReplicatedStorage/MinecraftShared/Collision.lua -text
+roblox/ReplicatedStorage/MinecraftShared/InputState.lua -text

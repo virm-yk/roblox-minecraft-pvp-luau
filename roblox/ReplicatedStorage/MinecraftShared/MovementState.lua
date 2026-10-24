@@ -13,6 +13,12 @@
 --   LastAppliedInputSeq : highest client input sequence whose effects are included
 --                         in this state. Advanced only when an input is consumed.
 --
+-- Seq and ServerTick are INDEPENDENT clocks (see MovementConfig). The client
+-- advances Seq once per predicted step while the server drops catch-up backlog
+-- under load, so the two drift. LastAppliedInputSeq may therefore be larger or
+-- smaller than ServerTick; the two are never compared numerically. Seq only
+-- orders/acknowledges/replays input; ServerTick only drives simulation time.
+--
 -- The snapshot shape is the state shape; every field is remote-safe.
 
 local MovementConfig = require(script.Parent.MovementConfig)
@@ -243,9 +249,6 @@ function MovementState.fromSnapshot(raw: any): State?
 	if not isIntegerInRange(raw.LastAppliedInputSeq, 0, MAX_INT) then
 		return nil
 	end
-	if raw.LastAppliedInputSeq > raw.ServerTick then
-		return nil
-	end
 
 	if not isFiniteVector(raw.Position) or not isFiniteVector(raw.Velocity) then
 		return nil
@@ -317,9 +320,7 @@ function MovementState.isPlausible(state: State): boolean
 	if math.abs(p.Z) > limits.MaxCoordinateBlocks then
 		return false
 	end
-	if state.LastAppliedInputSeq > state.ServerTick then
-		return false
-	end
+	-- No Seq/ServerTick comparison here: they are different clocks (see header).
 	if state.JumpTicks < 0 or state.JumpTicks > MovementConfig.Physics.JumpTicks then
 		return false
 	end

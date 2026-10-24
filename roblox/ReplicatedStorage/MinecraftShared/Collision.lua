@@ -36,6 +36,13 @@
 -- Broad phase: registered boxes are bucketed into integer block cells, and a
 -- query visits only the cells its box overlaps. Candidate order is sorted by
 -- registration index, so results never depend on hash iteration order.
+--
+-- Rebuilding: a World is immutable once populated. There is no removal API on
+-- purpose; CollisionAdapter.watch builds a brand new World and swaps the
+-- reference, which is what makes "rescan" free of duplicate registrations.
+-- The per-box cell budget (MovementConfig.Collision.MaxCellsPerBox) is checked
+-- by cellCount before registration, so an oversized part is rejected and
+-- reported instead of exploding the whole rebuild.
 
 local MovementConfig = require(script.Parent.MovementConfig)
 
@@ -193,6 +200,20 @@ function Collision.newWorld(): World
 	return { Boxes = {}, Labels = {}, Cells = {}, Count = 0 }
 end
 
+-- Number of integer cells a box would be bucketed into. Zero for a degenerate or
+-- non-finite box. Callers use this to reject oversized geometry BEFORE addBox,
+-- which is the difference between a reported authoring error and a rebuild that
+-- throws halfway through.
+function Collision.cellCount(box: Box): number
+	if not Collision.isFiniteBox(box) then
+		return 0
+	end
+	local x0, x1 = cellRange(box.Min.X, box.Max.X)
+	local y0, y1 = cellRange(box.Min.Y, box.Max.Y)
+	local z0, z1 = cellRange(box.Min.Z, box.Max.Z)
+	return (x1 - x0 + 1) * (y1 - y0 + 1) * (z1 - z0 + 1)
+end
+
 -- Registers a static solid box. Registration order is the tie-break order for
 -- candidates, and box volume must be positive: a zero-thickness "solid" is an
 -- authoring error, not a valid collider.
@@ -222,7 +243,7 @@ function Collision.addBox(world: World, box: Box, label: string?): number
 	local y0, y1 = cellRange(box.Min.Y, box.Max.Y)
 	local z0, z1 = cellRange(box.Min.Z, box.Max.Z)
 
-	local cells = (x1 - x0 + 1) * (y1 - y0 + 1) * (z1 - z0 + 1)
+	local cells = Collision.cellCount(box)
 	if cells > MovementConfig.Collision.MaxCellsPerBox then
 		error(
 			string.format(
